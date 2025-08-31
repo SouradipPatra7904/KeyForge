@@ -1,45 +1,41 @@
-#pragma once
+#ifndef KEYFORGE_SERVER_HPP
+#define KEYFORGE_SERVER_HPP
 
 #include "Store.hpp"
-
 #include <atomic>
-#include <string>
 #include <thread>
 #include <vector>
+#include <mutex>
 
 namespace keyforge {
 
-/**
- * @brief KeyForge server class
- * 
- * Supports basic commands:
- *   - PUT key value
- *   - GET key
- *   - DEL key
- *   - UPDATE key new_value
- *   - SHUTDOWN
- * 
- * Handles multiple clients concurrently.
- */
 class Server {
 public:
     explicit Server(int port);
+    ~Server();
 
-    // start the server loop
+    // Main entry point
     void run();
+
+    // Externally trigger shutdown (e.g., from signal handler)
+    void requestShutdown();
 
 private:
     int port_;
     Store store_;
 
-    // shutdown flag shared across threads
-    static std::atomic<bool> shutdown_requested_;
+    std::atomic<bool> shutdown_requested_{false};
+    int server_fd_{-1};
 
-    // track client threads for cleanup
-    std::vector<std::thread> client_threads_;
+    std::vector<std::thread> workers_;
+    std::mutex workers_mutex_;
 
-    // per-client handler
-    void handle_client(int client_fd);
+    void handleClient(int client_fd);
+
+    // Utility
+    static void send_all(int fd, const std::string& msg);
 };
 
 } // namespace keyforge
+
+#endif // KEYFORGE_SERVER_HPP

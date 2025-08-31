@@ -1,150 +1,178 @@
 #include "keyforge/Server.hpp"
 
-#include <arpa/inet.h>
-#include <cstring>
+#include <unordered_map>
 #include <iostream>
-#include <netinet/in.h>
-#include <sys/socket.h>
+#include <sstream>
+#include <cstring>
 #include <unistd.h>
+#include <netinet/in.h>
 
 namespace keyforge {
 
-// static atomic initialization
-std::atomic<bool> Server::shutdown_requested_{false};
-
 Server::Server(int port) : port_(port) {}
 
+Server::~Server() {
+    if (server_fd_ != -1) {
+        close(server_fd_);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(workers_mutex_);
+        for (auto& w : workers_) {
+            if (w.joinable()) {
+                w.join();
+            }
+        }
+    }
+}
+
+void Server::requestShutdown() {
+    shutdown_requested_.store(true);
+    // Closing listening socket will break accept()
+    if (server_fd_ != -1) {
+        shutdown(server_fd_, SHUT_RDWR);
+        close(server_fd_);
+        server_fd_ = -1;
+    }
+}
+
+void Server::send_all(int fd, const std::string& msg) {
+    size_t total_sent = 0;
+    while (total_sent < msg.size()) {
+        ssize_t sent = send(fd, msg.data() + total_sent, msg.size() - total_sent, 0);
+        if (sent <= 0) break;
+        total_sent += sent;
+    }
+}
+
+void Server::handleClient(int client_fd) {
+    char buffer[1024];
+    while (true) {
+        memset(buffer, 0, sizeof(buffer));
+        ssize_t n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+        if (n <= 0) {
+            close(client_fd);
+            return;
+        }
+
+        std::istringstream iss(buffer);
+        std::string cmd, key, value;
+        iss >> cmd;
+
+        std::string response;
+
+        if (cmd == "PUT") {
+            iss >> key >> value;
+            store_.put(key, value);
+            response = "OK\n";
+        }
+
+        else if (cmd == "GET") {
+            iss >> key;
+            auto val = store_.get(key);
+            response = val ? *val + "\n" : "NOT_FOUND\n";
+        }
+
+        /**
+         * 
+         * else if (cmd == "GET_KEY") {
+            std::string value;
+            iss >> value;
+            bool found = false;
+            for (const auto& pair : store_) {
+                if (pair.second == value) {
+                    response = "OK " + pair.first + "\n";
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                response = "NOT_FOUND\n";
+            }
+        }
+         */
+        
+        else if (cmd == "DELETE") {
+            iss >> key;
+            bool removed = store_.remove(key);
+            response = removed ? "DELETED\n" : "NOT_FOUND\n";
+        }
+        else if (cmd == "UPDATE") {
+            iss >> key >> value;
+            bool updated = store_.update(key, value);
+            response = updated ? "UPDATED\n" : "NOT_FOUND\n";
+        }
+        else if (cmd == "SHUTDOWN") {
+            response = "Server shutting down...\nType anything and enter to exit this NetCat session.\n";
+            send_all(client_fd, response);
+            close(client_fd);
+            requestShutdown();
+            return;
+        }
+        else {
+            response = "ERROR: Unknown command\nValid Commands : [GET, PUT, UPDATE, DELETE, SHUTDOWN]\n";
+        }
+
+        send_all(client_fd, response);
+    }
+}
+
 void Server::run() {
-    int server_fd;
-    struct sockaddr_in address;
+    server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd_ < 0) {
+        perror("socket");
+        return;
+    }
+
     int opt = 1;
-    socklen_t addrlen = sizeof(address);
-
-    // Create socket file descriptor
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
-        perror("socket failed");
-        exit(EXIT_FAILURE);
+    if (setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        perror("setsockopt");
+        return;
     }
 
-    // Forcefully attaching socket to the port
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
-                   &opt, sizeof(opt))) {
-        perror("setsockopt failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port_);
+
+    if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return;
     }
 
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port_);
-
-    // Bind
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
-
-    // Listen
-    if (listen(server_fd, 10) < 0) {
-        perror("listen failed");
-        close(server_fd);
-        exit(EXIT_FAILURE);
+    if (listen(server_fd_, 10) < 0) {
+        perror("listen");
+        return;
     }
 
     std::cout << "KeyForge server listening on port " << port_ << "...\n";
 
-    while (!shutdown_requested_) {
-        int client_fd = accept(server_fd, (struct sockaddr*)&address, &addrlen);
+    while (!shutdown_requested_.load()) {
+        sockaddr_in client_addr{};
+        socklen_t len = sizeof(client_addr);
+        int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &len);
+
         if (client_fd < 0) {
-            if (shutdown_requested_) break; // stop gracefully
-            perror("accept failed");
+            if (shutdown_requested_.load()) break; // caused by shutdown()
+            perror("accept");
             continue;
         }
 
-        // Spawn a thread per client
-        client_threads_.emplace_back(&Server::handle_client, this, client_fd);
+        std::lock_guard<std::mutex> lock(workers_mutex_);
+        workers_.emplace_back(&Server::handleClient, this, client_fd);
     }
 
-    // Join all client threads before exiting
-    for (auto& t : client_threads_) {
-        if (t.joinable()) t.join();
-    }
-
-    close(server_fd);
-    std::cout << "Server shut down gracefully.\n";
-}
-
-void Server::handle_client(int client_fd) {
-    char buffer[1024] = {0};
-
-    while (!shutdown_requested_) {
-        ssize_t valread = read(client_fd, buffer, sizeof(buffer) - 1);
-        if (valread <= 0) break; // client disconnected
-        buffer[valread] = '\0';
-
-        std::string cmd(buffer);
-        std::string response;
-
-        // trim newline characters
-        if (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r'))
-            cmd.pop_back();
-
-        // Command parsing
-        if (cmd.rfind("PUT", 0) == 0) {
-            size_t key_start = cmd.find(" ") + 1;
-            size_t value_start = cmd.find(" ", key_start) + 1;
-            if (key_start != std::string::npos && value_start != std::string::npos) {
-                std::string key = cmd.substr(key_start, value_start - key_start - 1);
-                std::string value = cmd.substr(value_start);
-                store_.put(key, value);
-                response = "OK\n";
-            } else {
-                response = "ERROR: Invalid PUT format\n";
+    {
+        std::lock_guard<std::mutex> lock(workers_mutex_);
+        for (auto& w : workers_) {
+            if (w.joinable()) {
+                w.join();
             }
-        } else if (cmd.rfind("GET", 0) == 0) {
-            std::string key = cmd.substr(4);
-            auto val = store_.get(key);
-            response = val.has_value() ? val.value() + "\n" : "NOT_FOUND\n";
         }
-        else if (cmd.rfind("DELETE", 0) == 0) {
-            std::string key = cmd.substr(7);
-            if (store_.remove(key))
-                response = "DELETED\n";
-            else
-                response = "NOT_FOUND\n";
-        }
-        else if (cmd.rfind("UPDATE", 0) == 0) {
-            size_t key_start = cmd.find(" ") + 1;
-            size_t value_start = cmd.find(" ", key_start) + 1;
-            if (key_start != std::string::npos && value_start != std::string::npos) {
-                std::string key = cmd.substr(key_start, value_start - key_start - 1);
-                std::string value = cmd.substr(value_start);
-                if (store_.remove(key)) {
-                    store_.put(key, value);
-                    response = "UPDATED\n";
-                } else {
-                    response = "NOT_FOUND\n";
-                }
-            } else {
-                response = "ERROR: Invalid UPDATE format\n";
-            }
-        } else if (cmd.rfind("SHUTDOWN", 0) == 0) {
-            response = "Server shutting down...\n";
-            shutdown_requested_ = true;
-            send(client_fd, response.c_str(), response.size(), 0);
-            break;
-        } else {
-            response = "ERROR: Unknown command\n Valid Commands : [GET, PUT, UPDATE, DELETE, SHUTDOWN]";
-        }
-
-        // send response back to client
-        if (!response.empty()) {
-            send(client_fd, response.c_str(), response.size(), 0);
-        }
+        workers_.clear();
     }
 
-    close(client_fd);
+    std::cout << "Server stopped.\n";
 }
 
 } // namespace keyforge
