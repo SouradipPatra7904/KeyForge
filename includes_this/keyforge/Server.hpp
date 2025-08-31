@@ -34,6 +34,15 @@ private:
 
     // Utility
     static void send_all(int fd, const std::string& msg);
+
+    // Number of Connected clients counter
+    std::atomic<size_t> connected_clients_{0};
+
+    // Authentication variables :
+    std::unordered_set<std::string> auth_tokens_;  // set of valid tokens
+    std::unordered_map<int, bool> client_authenticated_; // maps client_fd -> bool
+    std::mutex auth_mutex_;
+
 };
 
 } // namespace keyforge
