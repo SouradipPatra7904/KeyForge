@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <netinet/in.h>
 
+
 namespace keyforge {
 
 Server::Server(int port) : port_(port) {}
@@ -73,25 +74,12 @@ void Server::handleClient(int client_fd) {
             response = val ? *val + "\n" : "NOT_FOUND\n";
         }
 
-        /**
-         * 
-         * else if (cmd == "GET_KEY") {
-            std::string value;
+        else if (cmd == "GET_KEY") {
             iss >> value;
-            bool found = false;
-            for (const auto& pair : store_) {
-                if (pair.second == value) {
-                    response = "OK " + pair.first + "\n";
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                response = "NOT_FOUND\n";
-            }
+            auto key_opt = store_.getKeyByValue(value);
+            response = key_opt ? ("OK. Key found :" + *key_opt + "\n") : "NOT_FOUND\n";
         }
-         */
-        
+    
         else if (cmd == "DELETE") {
             iss >> key;
             bool removed = store_.remove(key);
